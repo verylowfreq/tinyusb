@@ -58,6 +58,9 @@
 #define CH32_ISR_MAX_RETRIES  3
 #endif
 
+#define CH32_ATTACH_DEBOUNCE_FRAMES  8
+#define CH32_DETACH_DEBOUNCE_FRAMES  8
+
 #define CH32_WAIT_SIE_IDLE() \
   do { uint32_t _to = CH32_WAIT_TIMEOUT; while (!(USBFSH->MIS_ST & USBFS_UMS_SIE_FREE) && --_to) {} } while (0)
 
@@ -117,7 +120,11 @@ typedef struct {
   volatile bool armed;                  // a transaction is on the wire
   volatile uint16_t armed_frame;        // frame_count when armed (deadline base)
 
-  bool     attached;                    // device present (set by the SOF/DETECT attach poll)
+  bool     attached;                    // device present (set after SOF debounce)
+  uint8_t  attach_debounce;             // consecutive SOFs seeing DEV_ATTACH while unattached
+  uint8_t  detach_debounce;             // consecutive SOFs seeing detached line while attached
+  bool     port_resetting;              // suppress hotplug state changes during bus reset
+  uint16_t reset_ignore_until;          // SOF frame threshold after reset_end
   tusb_speed_t root_speed;              // survives hcd_device_close(0)
 } ch32_hcd_t;
 
@@ -454,16 +461,20 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   // V307 FIX: do NOT busy-wait for SOF_PRES at IRQ entry — burns ~20ms/IRQ and
   // starves the host stack. Process the pending flags directly.
   uint8_t fg = USBFSH->INT_FG;
+  bool ignore_hotplug = _hcd.port_resetting || ((int16_t)(_hcd.frame_count - _hcd.reset_ignore_until) < 0);
 
-  // DETECT edge: fast-path hot-plug attach. The edge toggles spuriously DURING
-  // transactions, but only when a device is already attached; while unattached
-  // (no transactions in flight) it is a real connect. Clear it either way.
+  // DETECT is noisy during traffic. Use it only as a hint that a connect or
+  // disconnect transition may be underway; SOF sampling confirms the state.
   if (fg & USBFS_UIF_DETECT) {
+    uint8_t mis = USBFSH->MIS_ST;
+    uint8_t host_ctrl = USBFSH->HOST_CTRL;
     USBFSH->INT_FG = USBFS_UIF_DETECT;
-    if (!_hcd.attached && (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH)) {
-      _hcd.attached     = true;
-      _hcd.discon_polls = 0;
-      hcd_event_device_attach(rhport, true);
+    if (!ignore_hotplug && !_hcd.attached && (mis & USBFS_UMS_DEV_ATTACH)) {
+      if (_hcd.attach_debounce == 0) _hcd.attach_debounce = 1;
+    } else if (!ignore_hotplug && _hcd.attached && !(mis & USBFS_UMS_DEV_ATTACH)) {
+      if ((host_ctrl & USBFS_UH_PORT_EN) == 0) {
+        if (_hcd.detach_debounce == 0) _hcd.detach_debounce = 1;
+      }
     }
   }
 
@@ -472,15 +483,42 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   if (fg & USBFS_UIF_HST_SOF) {
     USBFSH->INT_FG = USBFS_UIF_HST_SOF;
     _hcd.frame_count++;
+    ignore_hotplug = _hcd.port_resetting || ((int16_t)(_hcd.frame_count - _hcd.reset_ignore_until) < 0);
 
-    if (!_hcd.attached) {
+    if (!ignore_hotplug && !_hcd.attached) {
       // Attach poll — catches a device already present at power-up, which makes
       // no DETECT edge. DEV_ATTACH reflects line state, valid with no SOF reply.
       if (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) {
-        _hcd.attached     = true;
-        _hcd.discon_polls = 0;
-        hcd_event_device_attach(rhport, true);
+        if (_hcd.attach_debounce < CH32_ATTACH_DEBOUNCE_FRAMES) {
+          _hcd.attach_debounce++;
+        } else {
+          _hcd.attached        = true;
+          _hcd.discon_polls    = 0;
+          _hcd.attach_debounce = 0;
+          _hcd.detach_debounce = 0;
+          hcd_event_device_attach(rhport, true);
+        }
+      } else {
+        _hcd.attach_debounce = 0;
       }
+    } else if (!ignore_hotplug && !(USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) &&
+               ((USBFSH->HOST_CTRL & USBFS_UH_PORT_EN) == 0)) {
+      if (_hcd.detach_debounce < CH32_DETACH_DEBOUNCE_FRAMES) {
+        _hcd.detach_debounce++;
+      } else {
+        USBFSH->HOST_EP_PID = 0;            // stop the dead transaction
+        _hcd.discon_polls = 0;
+        _hcd.attached     = false;
+        _hcd.busy_lock    = false;
+        _hcd.armed        = false;
+        _hcd.cur_idx      = -1;
+        _hcd.attach_debounce = 0;
+        _hcd.detach_debounce = 0;
+        s_ctrl_pending    = false;
+        hcd_event_device_remove(rhport, true);
+      }
+    } else if (!ignore_hotplug && _hcd.detach_debounce) {
+      _hcd.detach_debounce = 0;
     } else if (_hcd.discon_polls >= CH32_HOST_DISCON_POLLS) {
       // No-response disconnect: handle_xfer_done() counts consecutive timeouts
       // (H_RES=0). A present device alternates NAK/data (resets the counter);
@@ -491,6 +529,7 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
       _hcd.busy_lock    = false;
       _hcd.armed        = false;
       _hcd.cur_idx      = -1;
+      _hcd.detach_debounce = 0;
       hcd_event_device_remove(rhport, true);
     }
 
@@ -597,6 +636,9 @@ void hcd_port_reset(uint8_t rhport) {
   // reset_end via the vendor routine (a tight blocking 11ms pulse) — CtrlTransfer
   // only succeeds after the vendor's own reset/enable sequence.
   tusb_time_delay_ms_api(100);
+  _hcd.port_resetting  = true;
+  _hcd.attach_debounce = 0;
+  _hcd.detach_debounce = 0;
   hcd_int_disable(rhport);
 }
 
@@ -622,6 +664,10 @@ void hcd_port_reset_end(uint8_t rhport) {
   USBFSH->HOST_RX_DMA = (uint32_t) USBFS_RX_Buf;
   USBFSH->HOST_TX_DMA = (uint32_t) USBFS_TX_Buf;
   USBFSH->INT_FG      = 0xFF;
+  _hcd.port_resetting   = false;
+  _hcd.attach_debounce  = 0;
+  _hcd.detach_debounce  = 0;
+  _hcd.reset_ignore_until = (uint16_t)(_hcd.frame_count + 250); // ignore ~250ms after reset
   hcd_int_enable(rhport);
 }
 
